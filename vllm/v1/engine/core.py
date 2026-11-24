@@ -122,6 +122,7 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+_MIN_PREFILL_CAP = 8192
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -269,6 +270,7 @@ class EngineCore:
         scheduler_config = vllm_config.scheduler_config
         self.async_scheduling = scheduler_config.async_scheduling
         self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
+        self.prefill_balance_factor = scheduler_config.prefill_schedule_balance_factor
         # Steps that scheduled tokens; empty schedule() calls don't count.
         self.num_executed_steps = 0
 
@@ -2852,6 +2854,31 @@ class DPEngineCoreProc(EngineCoreProc):
 
         raise SystemExit
 
+    def _balance_prefill(self) -> None:
+        """Cap this rank's next prefill step at prefill_balance_factor times the
+        mean demand of the DP ranks that prefill."""
+        import torch
+
+        from vllm.distributed.utils import cpu_all_reduce_
+
+        demand = torch.zeros(self.dp_group.size(), dtype=torch.int64)
+        demand[self.dp_rank] = self.scheduler.pending_prefill_demand()
+        cpu_all_reduce_(
+            demand,
+            self.dp_group,
+            timeout=self.vllm_config.parallel_config.cpu_distributed_timeout,
+        )
+        active = [d for d in demand.tolist() if d > 0]
+        if not active:
+            return
+        cap = max(
+            int(self.prefill_balance_factor * sum(active) / len(active)),
+            _MIN_PREFILL_CAP,
+        )
+        if max(active) > cap:
+            self.scheduler.prefill_token_cap = cap
+            logger.debug("DP prefill demand %s capped at %d", active, cap)
+
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
         self.step_counter += 1
@@ -2872,6 +2899,13 @@ class DPEngineCoreProc(EngineCoreProc):
         elif self.enable_fault_tolerance and self.ft_sentinel.coordinator_disabled:
             # Coordinator disabled: never idle-pause; engines keep stepping.
             return True
+
+        if (
+            self.prefill_balance_factor > 0
+            and self.prefill_schedule_interval > 1
+            and self.step_counter % self.prefill_schedule_interval == 0
+        ):
+            self._balance_prefill()
 
         return has_unfinished
 

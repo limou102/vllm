@@ -120,6 +120,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
         self.use_aiter_tp_all_gather: bool = False
+        self.aiter_ag_rs_any_graph = envs.VLLM_ROCM_AITER_AG_RS_ANY_GRAPH
 
         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
         config = get_current_vllm_config_or_none()
@@ -885,7 +886,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         Requires:
         - uniform batches
-        - FULL CUDAgraphs
+        - FULL CUDAgraphs, unless VLLM_ROCM_AITER_AG_RS_ANY_GRAPH is set
         """
         if (
             not self.use_aiter_ag_rs
@@ -895,6 +896,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return False
         if sizes is not None:
             return False
+        if self.aiter_ag_rs_any_graph:
+            return True
 
         from vllm.config.compilation import CUDAGraphMode
         from vllm.forward_context import get_forward_context
@@ -953,6 +956,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # shape
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
+
+        # One launch for all tensors, uneven per-rank sizes included.
+        if self.aiter_ag_rs_any_graph and self._can_use_aiter_ag_rs(None):
+            aiter_comm = self.aiter_ar_comm
+            assert aiter_comm is not None
+            inputs = [input_] if isinstance(input_, torch.Tensor) else list(input_)
+            outs = aiter_comm.aiter_ca.custom_all_gatherv(inputs, sizes)
+            if outs is not None:
+                return outs[0] if isinstance(input_, torch.Tensor) else outs
 
         if self._can_use_aiter_ag_rs(sizes):
             aiter_comm = self.aiter_ar_comm

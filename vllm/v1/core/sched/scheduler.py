@@ -699,6 +699,22 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def pending_prefill_demand(self) -> int:
+        budget = self.max_num_scheduled_tokens
+        chunk = self.scheduler_config.long_prefill_token_threshold or budget
+        demand = 0
+        for request in self.running:
+            if request.is_prefill_chunk:
+                demand += min(request.num_tokens - request.num_computed_tokens, chunk)
+        for request in self.waiting:
+            if demand >= budget:
+                break
+            computed = request.num_computed_tokens
+            if computed == 0:
+                _, computed, _ = self.kv_cache_manager.get_computed_blocks(request)
+            demand += min(max(request.num_tokens - computed, 0), chunk)
+        return min(demand, budget)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -726,6 +742,8 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        prefill_cap = self.prefill_token_cap
+        self.prefill_token_cap = None
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         input_budget = self.scheduler_config.max_num_batched_tokens
@@ -828,6 +846,11 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if prefill_cap is not None and request.is_prefill_chunk:
+                if prefill_cap <= 0:
+                    req_index += 1
+                    continue
+                num_new_tokens = min(num_new_tokens, prefill_cap)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -990,6 +1013,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if prefill_cap is not None and request.is_prefill_chunk:
+                prefill_cap -= num_new_tokens
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1373,6 +1398,10 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    if prefill_cap is not None and not pad_spec_decode:
+                        if prefill_cap <= 0:
+                            break
+                        num_new_tokens = min(num_new_tokens, prefill_cap)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1620,6 +1649,8 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if prefill_cap is not None and not pad_spec_decode:
+                    prefill_cap -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -1667,7 +1698,10 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 _, num_waiting = self.get_request_counts()
-                self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+                # Prefills held back by the balancing cap do not count.
+                self.prefill_capacity_bound = num_waiting > len(
+                    self.deferred_waiting
+                ) and not (prefill_cap is not None and prefill_cap <= 0)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

@@ -244,6 +244,12 @@ class SchedulerConfig:
     already-admitted prompt, so a long prompt can take up to N times as many
     steps to finish prefilling."""
 
+    prefill_schedule_balance_factor: float = Field(default=0.0, ge=0.0)
+    """With data parallelism and `prefill_schedule_interval` > 1, cap the prefill
+    tokens of each rank in a prefill step at this factor times the mean demand
+    of the ranks that prefill (at least 8192), so that one rank's long prefill
+    does not stall the others. 0 (the default) disables the cap."""
+
     cache_aware_admission_window: int = Field(default=0, ge=0)
     """Look-ahead window for cache-aware admission. Within the first N waiting
     requests, those whose prefix is already in the KV cache are admitted ahead
@@ -358,6 +364,7 @@ class SchedulerConfig:
             "scheduler_reserve_full_isl",
             "watermark",
             "prefill_schedule_interval",
+            "prefill_schedule_balance_factor",
             "async_scheduling",
             "stream_interval",
         }

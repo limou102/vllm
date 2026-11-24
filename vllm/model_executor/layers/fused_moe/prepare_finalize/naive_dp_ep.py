@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -93,6 +94,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         super().__init__()
         self.is_sequence_parallel = is_sequence_parallel
         self._num_dispatchers = num_dispatchers
+        self._mxfp8_dispatch = (
+            envs.VLLM_ROCM_DEP_MXFP8_DISPATCH and current_platform.is_rocm()
+        )
         # Set by FusedMoEWithLoRA.set_mapping() when LoRA is active. When
         # present, prepare() dispatches the per-token LoRA mapping alongside
         # hidden_states and writes the gathered result back to the context so
@@ -170,6 +174,33 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         finally:
             dbo_switch_to_compute_sync()
 
+    def _prepare_mxfp8(
+        self, a1: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    ) -> mk.PrepareResultType:
+        """Dispatch MXFP8 rows and E8M0 scales, viewed as bf16 so the 16-bit
+        AITER all-gather kernels can carry them."""
+        q, scale = moe_kernel_quantize_input(
+            a1, None, "mxfp8", per_act_token_quant=False, is_scale_swizzled=False
+        )
+        assert scale is not None
+        with self._comm_region():
+            res = get_ep_group().dispatch(
+                q.view(torch.bfloat16),
+                topk_weights,
+                topk_ids,
+                is_sequence_parallel=self.is_sequence_parallel,
+                extra_tensors=[scale.view(torch.bfloat16)],
+            )
+        assert len(res) == 4
+        q_all, topk_weights, topk_ids, (scale_all,) = res
+        return (
+            q_all.view(q.dtype),
+            scale_all.view(torch.float8_e8m0fnu),
+            None,
+            topk_ids,
+            topk_weights,
+        )
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -188,6 +219,15 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
                 "apply_router_weight_on_input is only implemented for topk=1"
             )
             a1 = a1 * topk_weights.to(a1.dtype)
+
+        if (
+            self._mxfp8_dispatch
+            and defer_input_quant
+            and a1.dtype == torch.bfloat16
+            and a1.shape[-1] % 64 == 0
+            and self._lora_context is None
+        ):
+            return self._prepare_mxfp8(a1, topk_weights, topk_ids)
 
         a1q, scales, a1q_scale_orig = _quantize_and_setup_dispatch(
             a1, quant_config, defer_input_quant

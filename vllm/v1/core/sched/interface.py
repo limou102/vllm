@@ -50,6 +50,13 @@ class SchedulerInterface(ABC):
     ) -> None:
         raise NotImplementedError
 
+    # Prefill token cap for the next schedule() only, set by DP prefill balancing.
+    prefill_token_cap: int | None = None
+
+    def pending_prefill_demand(self) -> int:
+        """Prefill tokens the next uncapped schedule() would run."""
+        return 0
+
     @abstractmethod
     def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.

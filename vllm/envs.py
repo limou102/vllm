@@ -151,6 +151,8 @@ if TYPE_CHECKING:
     VLLM_FP8_MOE_REQUANT: Literal["none", "mxfp4"] = "none"
     VLLM_FP8_MOE_REQUANT_ACT: Literal["a8w4", "a4w4", "a16w4"] = "a8w4"
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
+    VLLM_ROCM_AITER_AG_RS_ANY_GRAPH: bool = False
+    VLLM_ROCM_DEP_MXFP8_DISPATCH: bool = False
     VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4: bool | None = None
     VLLM_ROCM_USE_AITER_MOE_SITUV2: Literal["auto", "a4w4", "a8w4", "a16w4"] = "auto"
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
@@ -1410,6 +1412,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #       see PR #39177 for benchmarks)
     "VLLM_ROCM_AITER_MOE_DISPATCH_POLICY": lambda: int(
         os.getenv("VLLM_ROCM_AITER_MOE_DISPATCH_POLICY", "0")
+    ),
+    # Use the AITER IPC all-gather / reduce-scatter in any CUDA graph mode, not
+    # only FULL graphs, and gather all EP dispatch tensors in one launch.
+    "VLLM_ROCM_AITER_AG_RS_ANY_GRAPH": lambda: (
+        os.getenv("VLLM_ROCM_AITER_AG_RS_ANY_GRAPH", "0").lower() in ("true", "1")
+    ),
+    # Naive DP+EP dispatch: all-gather MXFP8 (fp8 + e8m0 1x32 scales) instead
+    # of bf16 MoE inputs, for AITER MoE kernels with MXFP8 activations.
+    "VLLM_ROCM_DEP_MXFP8_DISPATCH": lambda: (
+        os.getenv("VLLM_ROCM_DEP_MXFP8_DISPATCH", "0").lower() in ("true", "1")
     ),
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (

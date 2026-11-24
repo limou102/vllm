@@ -451,6 +451,9 @@ def rocm_aiter_fused_experts(
             else GateMode.SEPARATED.value
         )
 
+    # MXFP8 dispatch hands over quantized rows.
+    if q_dtype_a is None and hidden_states.dtype == torch.float8_e4m3fn:
+        q_dtype_a = hidden_states.dtype
     return rocm_aiter_ops.fused_moe(
         hidden_states,
         w1,
